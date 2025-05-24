@@ -9,7 +9,7 @@ import warnings
 import pickle
 import math
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional, Union
 from datetime import datetime
 
 import torch
@@ -20,10 +20,15 @@ from scipy import signal
 from scipy.io import wavfile
 from scipy.interpolate import interp1d
 
-from scenedetect.video_manager import VideoManager
-from scenedetect.scene_manager import SceneManager
-from scenedetect.stats_manager import StatsManager
-from scenedetect.detectors import ContentDetector
+from scenedetect import (
+    open_video,
+    ContentDetector,
+    SceneManager,
+    StatsManager,
+    SceneDetector,
+    SceneList,
+)
+
 
 from huggingface_hub import hf_hub_download
 from deepface import DeepFace
@@ -163,20 +168,13 @@ class FaceProcessor:
         self.detector_backend: str = args.detector_backend
 
     def scenes_detect(self):
-        videoManager = VideoManager([self.args.video_file_path])
-        statsManager = StatsManager()
-        sceneManager = SceneManager(statsManager)
-        sceneManager.add_detector(ContentDetector())
-        baseTimecode = videoManager.get_base_timecode()
-        videoManager.set_downscale_factor()
-        videoManager.start()
-        sceneManager.detect_scenes(frame_source=videoManager)
-        sceneList = sceneManager.get_scene_list(baseTimecode)
+        sceneList = self.custom_detect_scenes(
+            video_path=self.args.video_file_path,
+            detector=ContentDetector(),
+            show_progress=True,
+            backend=self.args.scene_detector_backend,
+        )
         savePath = os.path.join(self.args.pywork_path, "scene.pckl")
-        if sceneList == []:
-            sceneList = [
-                (videoManager.get_base_timecode(), videoManager.get_current_timecode())
-            ]
         with open(savePath, "wb") as fil:
             pickle.dump(sceneList, fil)
             sys.stderr.write(
@@ -188,6 +186,67 @@ class FaceProcessor:
             + " Scene detection and save in %s \r\n" % self.args.pywork_path
         )
         return sceneList
+
+    def custom_detect_scenes(
+        self,
+        video_path: str,
+        detector: SceneDetector,
+        stats_file_path: Optional[str] = None,
+        show_progress: bool = False,
+        backend: str = "opencv",
+        start_time: Optional[Union[str, float, int]] = None,
+        end_time: Optional[Union[str, float, int]] = None,
+        start_in_scene: bool = False,
+    ) -> SceneList:
+        """Perform scene detection on a given video `path` using the specified `detector`.
+
+        Arguments:
+            video_path: Path to input video (absolute or relative to working directory).
+            detector: A `SceneDetector` instance (see :mod:`scenedetect.detectors` for a full list
+                of detectors).
+            stats_file_path: Path to save per-frame metrics to for statistical analysis or to
+                determine a better threshold value.
+            show_progress: Show a progress bar with estimated time remaining. Default is False.
+            start_time: Starting point in video, in the form of a timecode ``HH:MM:SS[.nnn]`` (`str`),
+                number of seconds ``123.45`` (`float`), or number of frames ``200`` (`int`).
+            end_time: Starting point in video, in the form of a timecode ``HH:MM:SS[.nnn]`` (`str`),
+                number of seconds ``123.45`` (`float`), or number of frames ``200`` (`int`).
+            start_in_scene: Assume the video begins in a scene. This means that when detecting
+                fast cuts with `ContentDetector`, if no cuts are found, the resulting scene list
+                will contain a single scene spanning the entire video (instead of no scenes).
+                When detecting fades with `ThresholdDetector`, the beginning portion of the video
+                will always be included until the first fade-out event is detected.
+
+        Returns:
+            List of scenes as pairs of (start, end) :class:`FrameTimecode` objects.
+
+        Raises:
+            :class:`VideoOpenFailure`: `video_path` could not be opened.
+            :class:`StatsFileCorrupt`: `stats_file_path` is an invalid stats file
+            ValueError: `start_time` or `end_time` are incorrectly formatted.
+            TypeError: `start_time` or `end_time` are invalid types.
+        """
+        video = open_video(video_path, backend=backend)
+        if start_time is not None:
+            start_time = video.base_timecode + start_time
+            video.seek(start_time)
+        if end_time is not None:
+            end_time = video.base_timecode + end_time
+        # To reduce memory consumption when not required, we only add a StatsManager if we
+        # need to save frame metrics to disk.
+        scene_manager = SceneManager(StatsManager() if stats_file_path else None)
+        scene_manager.add_detector(detector)
+        scene_manager.detect_scenes(
+            video=video,
+            show_progress=show_progress,
+            end_time=end_time,
+        )
+        if scene_manager.stats_manager is not None:
+            scene_manager.stats_manager.save_to_csv(csv_file=stats_file_path)
+        scene_list = scene_manager.get_scene_list(start_in_scene=start_in_scene)
+        if scene_list == []:
+            scene_list = [(video.base_timecode, video.duration)]
+        return scene_list
 
     def detect_faces(self):
         """Run face detection on all frames"""
@@ -226,11 +285,9 @@ class FaceProcessor:
 
                         bbox = [x, y, x + w, y + h]
 
-                        frame_detections.append({
-                            "frame": fidx,
-                            "bbox": bbox,
-                            "conf": face["confidence"]
-                        })
+                        frame_detections.append(
+                            {"frame": fidx, "bbox": bbox, "conf": face["confidence"]}
+                        )
 
             except Exception as e:
                 print(f"Error processing frame {fname}: {str(e)}")
@@ -310,11 +367,13 @@ class FaceProcessor:
                     )
                     > self.args.min_face_size
                 ):
-                    tracks.append({
-                        "frame": frameI,
-                        "bbox": bboxesI,
-                        "confidence": confidencesI,
-                    })
+                    tracks.append(
+                        {
+                            "frame": frameI,
+                            "bbox": bboxesI,
+                            "confidence": confidencesI,
+                        }
+                    )
         return tracks
 
     @staticmethod
@@ -515,6 +574,7 @@ class Pipeline:
         crop_scale: float = 0.40,
         device: Literal["auto", "cpu", "cuda", "mps"] = "auto",
         detector_backend: str = "yolov8",
+        scene_detector_backend: Literal["opencv", "pyav"] = "opencv",
         dtype: Literal["float32", "float16", "bfloat16"] = "float32",
         **kwargs,
     ):
@@ -525,6 +585,7 @@ class Pipeline:
             "bfloat16": torch.bfloat16,
         }[dtype]
         self.detector_backend: str = detector_backend
+        self.scene_detector_backend: str = scene_detector_backend
 
         self.video_path = video_path
 
